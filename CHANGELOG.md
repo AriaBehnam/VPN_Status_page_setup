@@ -3,6 +3,24 @@
 All notable changes to this project are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [2.2.0] – 2026-11-18
+
+### Added
+- **Refresh all** button and a **Refresh** button per client: for a router it scans the LAN and measures
+  the latency to its components, for a PC it measures the latency to the PC. At most 3 checks run at
+  once so the 4G links are not flooded.
+- Latency button on every component and router address, to check a single device.
+- Rename button on every component and router address (admin password). It writes devices.txt and keeps
+  all other lines; the name `router` marks the router, an empty name removes it.
+- **Disabled** section at the end of the page with all disabled routers and PCs.
+
+### Changed
+- Router and Components panels have the same width.
+- The separate scan and latency buttons of a router are replaced by the Refresh button.
+
+### Fixed
+- The yellow "several addresses answer" warning no longer runs out of the Router panel; it wraps.
+
 ## [2.1.0] – 2026-11-18
 
 ### Added

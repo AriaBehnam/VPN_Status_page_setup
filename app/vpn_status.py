@@ -77,6 +77,7 @@ RESTART_MSG = {
 HOST = ["nsenter", "-t", "1", "-m", "-u", "-i", "-n", "-p", "--"] if os.environ.get("IN_CONTAINER") else []
 
 scan, lat, fails, flashes, downloads = {}, {}, {}, {}, {}
+pinging = set()                            # (client, address) of single-component latency checks running
 lock = threading.Lock()
 create_lock = threading.Lock()
 update_lock = threading.Lock()
@@ -293,6 +294,55 @@ def read_devices():
     return out
 
 
+LABEL_RE = re.compile(r"^[^,|#\r\n]{0,40}$")
+
+
+def set_label(client, host, label):
+    """Name host number `host` behind `client` in devices.txt ("" removes the name). Keeps other lines."""
+    try:
+        lines = read_text(DEVICES).splitlines()
+        mode = os.stat(DEVICES).st_mode & 0o777
+    except FileNotFoundError:
+        lines, mode = [], 0o644
+    out, done = [], False
+    for line in lines:
+        p = [x.strip() for x in line.split("|")]
+        if not done and line.strip() and not line.lstrip().startswith("#") and p[0] == client:
+            line, done = devices_line(client, p, host, label), True
+        out.append(line)
+    if not done and label:
+        out.append(devices_line(client, [client], host, label))
+    write_file(DEVICES, "\n".join(out) + "\n", mode)
+
+
+def devices_line(client, parts, host, label):
+    labels = {}
+    for item in (parts[1].split(",") if len(parts) > 1 else []):
+        t = item.strip().split(None, 1)
+        if t and t[0].startswith(".") and t[0][1:].isdigit():
+            labels[t[0][1:]] = t[1] if len(t) > 1 else "device"
+    labels.pop(host, None)
+    if label:
+        labels[host] = label
+    line = "%s | %s" % (client, ", ".join(".%s %s" % (k, labels[k]) for k in sorted(labels, key=int)))
+    return line + (" | " + parts[2] if len(parts) > 2 and parts[2] else "")
+
+
+def rename_component(client, host, label):
+    label = " ".join(label.split())
+    if client not in read_ccd() or not host.isdigit() or not 0 < int(host) < 255:
+        return "Unknown component.", "err"
+    if not LABEL_RE.match(label):
+        return "Name: up to 40 characters, without , | or #.", "err"
+    try:
+        set_label(client, host, label)
+    except OSError as e:
+        return "Could not save %s: %s" % (DEVICES, e.strerror), "err"
+    if not label:
+        return "Name of .%s on %s removed." % (host, short(client)), "ok"
+    return "Component .%s on %s is now called %s." % (host, short(client), label), "ok"
+
+
 def is_router(label):
     return label.strip().lower() == "router"
 
@@ -337,6 +387,9 @@ def labelled(nets, labels):
 
 # ---------- scan and latency (only when a button is pressed) ----------
 
+net_slots = threading.BoundedSemaphore(3)   # at most 3 scans / latency runs at once (Refresh all)
+
+
 def alive(ip):
     return subprocess.call(["ping", "-c", "1", "-W", "1", "-n", ip],
                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL) == 0
@@ -345,23 +398,24 @@ def alive(ip):
 def do_scan(name, nets):
     found = []
     try:
-        for net in nets:
-            try:
-                network = ipaddress.ip_network(net, strict=False)
-            except ValueError:
-                continue
-            if network.num_addresses > SCAN_MAX_HOSTS:
-                continue
-            addrs = [str(h) for h in network.hosts()]
-            with ThreadPoolExecutor(64) as ex:
-                found += [a for a, ok in zip(addrs, ex.map(alive, addrs)) if ok]
+        with net_slots:
+            for net in nets:
+                try:
+                    network = ipaddress.ip_network(net, strict=False)
+                except ValueError:
+                    continue
+                if network.num_addresses > SCAN_MAX_HOSTS:
+                    continue
+                addrs = [str(h) for h in network.hosts()]
+                with ThreadPoolExecutor(64) as ex:
+                    found += [a for a, ok in zip(addrs, ex.map(alive, addrs)) if ok]
     finally:
         with lock:
             scan[name] = {"nets": nets, "hosts": found, "time": time.time(), "running": False}
 
 
 def ping_one(ip):
-    res = {"ok": False, "loss": 100.0}
+    res = {"ok": False, "loss": 100.0, "t": time.time()}
     try:
         p = subprocess.run(["ping", "-c", "5", "-i", "0.3", "-W", "2", "-n", ip],
                            capture_output=True, text=True, timeout=30)
@@ -376,29 +430,55 @@ def ping_one(ip):
     return res
 
 
+def save_latency(name, sess, results, running=False):
+    """Merge ping results into lat[name] (old results of another session are dropped). Needs lock."""
+    old = lat.get(name)
+    items = dict(old["items"]) if old and old["sess"] == sess else {}
+    items.update(results)
+    lat[name] = {"running": running, "time": time.time(), "sess": sess, "items": items}
+
+
 def do_ping(name, targets, sess):
     results = {}
     try:
-        with ThreadPoolExecutor(8) as ex:
-            results = dict(zip(targets, ex.map(ping_one, targets)))
+        with net_slots:
+            with ThreadPoolExecutor(8) as ex:
+                results = dict(zip(targets, ex.map(ping_one, targets)))
     finally:
         with lock:
-            lat[name] = {"running": False, "time": time.time(), "sess": sess, "items": results}
+            save_latency(name, sess, results)
 
 
-def router_lans(name):
-    """(client info, announced LANs) for an online router, else (None, ())."""
+def ping_component(name, ip):
+    """Latency to one address behind a connected router (only addresses inside its LANs)."""
     live, lans = read_status()
     c = live.get(name)
-    if not c or is_pc(name, read_ccd()):
-        return None, ()
-    return c, tuple(sorted(lans.get(name, [])))
-
-
-def start_scan(name):
-    c, nets = router_lans(name)
-    if not nets:
+    try:
+        a = ipaddress.ip_address(ip)
+        if not c or not any(a in ipaddress.ip_network(n, strict=False) for n in lans.get(name, [])):
+            return
+    except ValueError:
         return
+    sess = c.get("Connected Since (time_t)")
+    with lock:
+        if (name, ip) in pinging:
+            return
+        pinging.add((name, ip))
+
+    def run():
+        r = {}
+        try:
+            with net_slots:
+                r = ping_one(ip)
+        finally:
+            with lock:
+                pinging.discard((name, ip))
+                if r:
+                    save_latency(name, sess, {ip: r}, lat.get(name, {}).get("running", False))
+    threading.Thread(target=run, daemon=True).start()
+
+
+def start_scan(name, nets):
     with lock:
         if scan.get(name, {}).get("running"):
             return
@@ -406,18 +486,42 @@ def start_scan(name):
     threading.Thread(target=do_scan, args=(name, nets), daemon=True).start()
 
 
-def start_ping(name):
-    c, nets = router_lans(name)
-    labels = read_devices().get(name, {}).get("labels", {})
-    targets = [ip for ip, label in labelled(nets, labels) if not is_router(label)]
-    if not targets:
-        return
+def start_ping(name, c, targets):
     sess = c.get("Connected Since (time_t)")
     with lock:
         if lat.get(name, {}).get("running"):
             return
-        lat[name] = {"running": True, "time": time.time(), "sess": sess, "items": {}}
+        save_latency(name, sess, {}, running=True)
     threading.Thread(target=do_ping, args=(name, targets, sess), daemon=True).start()
+
+
+def refresh(name, live=None, lans=None, ccd=None, devcfg=None):
+    """Router: scan its LAN + latency to its components. PC: latency to the PC itself."""
+    if live is None:
+        live, lans = read_status()
+    c = live.get(name)
+    if not c:
+        return
+    ccd = read_ccd() if ccd is None else ccd
+    if is_pc(name, ccd):
+        vip = c.get("Virtual Address")
+        targets = [vip] if vip else []
+    else:
+        nets = tuple(sorted(lans.get(name, [])))
+        if nets:
+            start_scan(name, nets)
+        labels = (read_devices() if devcfg is None else devcfg).get(name, {}).get("labels", {})
+        targets = [ip for ip, label in labelled(nets, labels) if not is_router(label)]
+    if targets:
+        start_ping(name, c, targets)
+
+
+def refresh_all():
+    live, lans = read_status()
+    ccd, devcfg = read_ccd(), read_devices()
+    for name in live:
+        if not ccd.get(name, {}).get("disabled"):
+            refresh(name, live, lans, ccd, devcfg)
 
 
 # ---------- restart ----------
@@ -672,8 +776,8 @@ def site_devices(nets, cfg, s, l):
             seen[h] = (s["time"], True)
     pings = (l or {}).get("items", {})
     for ip, r in pings.items():
-        if ip not in seen or l["time"] >= seen[ip][0]:
-            seen[ip] = (l["time"], r.get("ok", False))
+        if ip not in seen or r.get("t", 0) >= seen[ip][0]:
+            seen[ip] = (r.get("t", 0), r.get("ok", False))
 
     def item(ip, label, state=None, hint=None):
         if state is None:
@@ -695,7 +799,8 @@ def site_devices(nets, cfg, s, l):
     else:   # no router labelled: whatever answers is probably the router
         router = [item(h, "Router", "ok", "found by scan") for h in unlabelled]
         if len(unlabelled) > 1:
-            note = pill("several answer – label the router in devices.txt", "warn")
+            note = ('<div class=warnbox>Several addresses answer. Rename the real router to '
+                    '<b>router</b> with %s.</div>' % ic("pencil"))
     return router, sorted(comps, key=lambda x: ip_key(x["ip"])), note
 
 
@@ -716,14 +821,23 @@ def latency_html(r, measuring):
         cls, round(r["min"]), round(r["max"]), ic("activity"), round(r["avg"]), loss)
 
 
-def device_row(x, measuring=False):
+def device_row(client, x, online, measuring=False):
     dot, text = STATE[x["state"]]
     lt = latency_html(x["lat"], measuring)
+    host = x["ip"].rsplit(".", 1)[-1]
+    current = "" if x["state"] == "unk" else "router" if x["label"] == "Router" else x["label"]
+    ping = ("<form method=post action=/ping><input type=hidden name=c value=\"%s\">"
+            "<input type=hidden name=ip value='%s'><button class='btn sm' title='%s'%s>%s</button></form>") % (
+        esc(client), esc(x["ip"]), "Measuring…" if measuring else "Latency",
+        "" if online and not measuring else " disabled", ic("activity", "pulse" if measuring else ""))
+    rename = ("<button type=button class='btn sm' title='Rename' data-c=\"%s\" data-h='%s' data-n=\"%s\" "
+              "data-ip='%s' onclick='ren(this)'>%s</button>") % (
+        esc(client), esc(host), esc(current), esc(x["ip"]), ic("pencil"))
     return ('<div class=dv><span class="dot %s" title="%s"></span>'
             '<div class=dn>%s<small>%s</small></div>'
-            '<div class=da><span class=mono>%s</span>%s</div>%s</div>') % (
+            '<div class=da><span class=mono>%s</span>%s</div><div class=bt>%s%s</div>%s</div>') % (
         dot, text, esc(x["label"]), esc(x["hint"] or text), esc(x["ip"]),
-        "<small>in vehicle %s</small>" % esc(x["real"]) if x["real"] else "",
+        "<small>in vehicle %s</small>" % esc(x["real"]) if x["real"] else "", ping, rename,
         "<div class=lt>%s</div>" % lt if lt else "")
 
 
@@ -765,7 +879,17 @@ def short(n):
     return n[7:] if n.startswith("client-") else n
 
 
-def site_card(n, c, d, cfg, nets, s, l):
+def valid_lat(c, l):
+    """Latency results only count for the current session of the client."""
+    return l if (c and l and l.get("sess") == c.get("Connected Since (time_t)")) else None
+
+
+def refresh_button(name, busy):
+    return form_button("/refresh", name, "Checking…" if busy else "Refresh",
+                       ic("scan", "spin" if busy else ""), not busy)
+
+
+def site_card(n, c, d, cfg, nets, s, l, busy_ips):
     on = c is not None
     dot, pills, vip = status_bits(c, d)
     shown = nets or tuple((d or {}).get("iroutes", []))
@@ -774,7 +898,7 @@ def site_card(n, c, d, cfg, nets, s, l):
 
     s = s if (on and s and s["nets"] == nets) else None
     scanning = bool(s and s["running"])
-    l = l if (on and l and l.get("sess") == c.get("Connected Since (time_t)")) else None
+    l = valid_lat(c, l)
     measuring = bool(l and l["running"])
     router, comps, note = site_devices(shown, cfg, None if scanning else s, None if measuring else l)
 
@@ -790,35 +914,27 @@ def site_card(n, c, d, cfg, nets, s, l):
         chips.append('<span class=muted>(configured)</span>')
     if not on:
         when = ""
-    elif scanning:
-        when = '<span class="muted pulse">scanning…</span>'
+    elif scanning or measuring:
+        when = '<span class="muted pulse">checking…</span>'
     elif s:
         when = '<span class=muted>checked %s</span>' % time.strftime("%H:%M", time.localtime(s["time"]))
     else:
         when = '<span class=muted>not checked yet – press %s</span>' % ic("scan")
-    lanrow = '<div class=lanrow>%s<b>LAN</b>%s<span class=when>%s</span></div>' % (ic("network"), "".join(chips), when)
+    lanrow = '<div class=lanrow>%s<b>LAN</b>%s<span class=when>%s</span></div>' % (
+        ic("network"), "".join(chips), when)
 
-    router_html = "".join(device_row(x) for x in router) or (
-        '<div class=empty>Press scan to find the router.</div>' if on else '<div class=empty>–</div>')
-    comps_html = "".join(device_row(x, measuring and x["state"] != "unk") for x in comps) or (
-        '<div class=empty>No components listed in devices.txt.</div>')
+    busy = lambda x, whole: (whole and measuring) or (n, x["ip"]) in busy_ips
+    router_html = "".join(device_row(n, x, on, busy(x, False)) for x in router) or (
+        '<div class=empty>Press refresh to find the router.</div>' if on else '<div class=empty>–</div>')
+    comps_html = "".join(device_row(n, x, on, busy(x, x["state"] != "unk")) for x in comps) or (
+        '<div class=empty>No components named yet. Refresh, then rename what is found.</div>')
     panels = ('<div class=panels>'
-              '<section class=panel><h3>%s Router %s</h3>%s</section>'
+              '<section class=panel><h3>%s Router</h3>%s%s</section>'
               '<section class=panel><h3>%s Components <span class=cnt>%d</span></h3>%s</section></div>') % (
         ic("router"), note, router_html, ic("cpu"), len(comps), comps_html)
 
-    actions = ""
-    if on:
-        has_targets = bool(nets) and any(x["state"] != "unk" for x in comps)
-        actions += form_button("/ping", n, "Latency to the components" if has_targets
-                               else "No components listed in devices.txt",
-                               ic("activity", "pulse" if measuring else ""), has_targets and not measuring)
-        actions += form_button("/scan", n, "Scan the LAN" + (" (last %s)" % time.strftime(
-            "%H:%M", time.localtime(s["time"])) if s and not scanning else ""),
-            ic("scan", "spin" if scanning else ""), bool(nets) and not scanning)
-    if d:
-        actions += toggle_button(n, d["disabled"])
-
+    actions = (refresh_button(n, scanning or measuring) if on else "") + (
+        toggle_button(n, d["disabled"]) if d else "")
     return ('<article class="card site %s"><div class=site-head>'
             '<div class=cname title="%s"><span class="dot %s"></span>%s%s</div>'
             '<span class=mono>%s</span>%s<div class=sess>%s</div><div class=act>%s</div></div>'
@@ -827,13 +943,26 @@ def site_card(n, c, d, cfg, nets, s, l):
         session_html(c), actions, lanrow, panels)
 
 
-def pc_row(n, c, d):
+def pc_row(n, c, d, l):
     dot, pills, vip = status_bits(c, d)
+    l = valid_lat(c, l)
+    busy = bool(l and l["running"])
+    lt = latency_html((l or {}).get("items", {}).get(vip), busy)
+    actions = (refresh_button(n, busy) if c else "") + (toggle_button(n, d["disabled"]) if d else "")
     return ('<tr class="%s"><td><div class=cname title="%s"><span class="dot %s"></span>%s%s</div>%s'
-            '<td class=mono>%s<td class=hide>%s<td><div class=act>%s</div></tr>') % (
+            '<td class=mono>%s<td class=hide>%s%s<td><div class=act>%s</div></tr>') % (
         "" if c else "off", esc(n), dot, ic("monitor"), esc(short(n)),
         "<div class=sub>%s</div>" % pills if pills else "", esc(vip), session_html(c),
-        toggle_button(n, d["disabled"]) if d else "")
+        "<div class=sub>%s</div>" % lt if lt else "", actions)
+
+
+def disabled_row(n, c, d, pc):
+    _, pills, vip = status_bits(c, d)
+    nets = "".join('<span class=chip>%s</span> ' % esc(x) for x in net_sort(d["iroutes"]))
+    return ('<tr><td><div class=cname title="%s"><span class="dot bad"></span>%s%s</div><div class=sub>%s</div>'
+            '<td class=mono>%s<td class=hide>%s<td><div class=act>%s</div></tr>') % (
+        esc(n), ic("monitor" if pc else "router"), esc(short(n)), pills, esc(vip),
+        nets or '<span class=muted>PC</span>', toggle_button(n, True))
 
 
 def downloads_html():
@@ -855,6 +984,8 @@ var $=function(i){return document.getElementById(i)};
 function ask(b){$("dc").value=b.dataset.c;$("da").value=b.dataset.a;$("dt").textContent=b.dataset.t;$("dp").value="";$("dlg").showModal();$("dp").focus()}
 function restart(){$("rp").value="";$("rdlg").showModal();$("rp").focus()}
 function upd(){$("up").value="";$("udlg").showModal();$("up").focus()}
+function ren(b){$("rc").value=b.dataset.c;$("rh").value=b.dataset.h;$("rn").value=b.dataset.n;
+ $("rt").textContent=b.dataset.ip;$("rpw").value="";$("ndlg").showModal();$("rn").focus()}
 function newc(){$("cf").reset();$("cdlg").showModal()}
 if(location.search)history.replaceState(null,"","/");
 setInterval(function(){if(document.querySelector("dialog[open]"))return;
@@ -869,19 +1000,24 @@ def render(msg="", kind=""):
                    key=lambda n: (n not in live, ccd.get(n, {}).get("disabled", False), n))
     with lock:
         scans = {k: dict(v) for k, v in scan.items()}
-        lats = {k: dict(v) for k, v in lat.items()}
-    sites, pcs = [], []
+        lats = {k: dict(v, items=dict(v["items"])) for k, v in lat.items()}
+        busy_ips = set(pinging)
+    sites, pcs, off = [], [], []
     for n in names:
         c, d = live.get(n), ccd.get(n)
-        if is_pc(n, ccd):
-            pcs.append(pc_row(n, c, d))
+        if d and d["disabled"]:
+            off.append(disabled_row(n, c, d, is_pc(n, ccd)))
+        elif is_pc(n, ccd):
+            pcs.append(pc_row(n, c, d, lats.get(n)))
         else:
             nets = tuple(sorted(lans.get(n, []))) if c else ()
-            sites.append(site_card(n, c, d, devcfg.get(n, {}), nets, scans.get(n), lats.get(n)))
-    ndis = sum(1 for d in ccd.values() if d["disabled"])
+            sites.append(site_card(n, c, d, devcfg.get(n, {}), nets, scans.get(n), lats.get(n), busy_ips))
+    ndis = len(off)
     free_ip = next_free_ip(ccd, live)
 
     tools = (
+        "<form method=post action=/refresh><input type=hidden name=c value='*'>"
+        "<button class=tbtn title='Check every connected client'>%sRefresh all</button></form>" % ic("scan") +
         '<button type=button class="tbtn primary" onclick="newc()">%sNew PC</button>' % ic("plus") +
         '<button type=button class=tbtn onclick="restart()">%sRestart OpenVPN</button>' % ic("restart") +
         "<form method=post action=/restart onsubmit=\"return confirm('Restart the status page?')\">"
@@ -897,14 +1033,18 @@ def render(msg="", kind=""):
         '<h2>%s Routers <span class=cnt>%d</span></h2>%s'
         '<h2>%s PCs <span class=cnt>%d</span></h2>'
         '<div class=card><table><tr><th>PC<th>VPN address<th class=hide>Session<th></tr>%s</table></div>'
-        '<div class=foot>Scan and latency run only when pressed. Latency is the round trip from the server to each '
-        'component behind the router. NAT sites show the address you use over the VPN and the real address inside '
+        '%s'
+        '<div class=foot>Checks run only when Refresh is pressed: a router\'s LAN is scanned and the latency from '
+        'the server to each component is measured; for a PC the latency to the PC is measured. NAT sites show the address you use over the VPN and the real address inside '
         'the vehicle. Disabling blocks new connections; a connected client stays up until it drops or OpenVPN '
         'restarts. Component names come from %s.%s</div>') % (
         len(live), ndis, len(names), tools,
         '<div class="msg %s">%s</div>' % (kind, esc(msg)) if msg else "", downloads_html(),
         ic("router"), len(sites), "".join(sites) or '<div class="card dls muted">No routers.</div>',
-        ic("monitor"), len(pcs), "".join(pcs) or '<tr><td colspan=4 class=muted>No PCs.</td></tr>', esc(DEVICES),
+        ic("monitor"), len(pcs), "".join(pcs) or '<tr><td colspan=4 class=muted>No PCs.</td></tr>',
+        ('<h2>%s Disabled <span class=cnt>%d</span></h2><div class=card><table><tr><th>Client<th>VPN address'
+         '<th class=hide>Network<th></tr>%s</table></div>' % (ic("power"), len(off), "".join(off))) if off else "",
+        esc(DEVICES),
         "<br>Version %s" % esc(version) if version else "")
 
     dialogs = (
@@ -921,6 +1061,16 @@ def render(msg="", kind=""):
         '<label>Admin password<input type=password name=p id=rp required autocomplete=off></label>'
         '<div class=row><button type=button class=b2 onclick="this.closest(\'dialog\').close()">Cancel</button>'
         '<button class=b1>Restart</button></div></form></dialog>'
+        # rename a component
+        '<dialog id=ndlg><form method=post action=/rename>'
+        '<div class=dh>Rename <span class=mono id=rt></span></div>'
+        '<input type=hidden name=c id=rc><input type=hidden name=h id=rh>'
+        '<label>Name<input name=name id=rn maxlength=40 placeholder="PLC" autocomplete=off></label>'
+        '<div class=sub style="margin:-6px 0 12px">Type <b>router</b> to mark it as the router. '
+        'Leave empty to remove the name.</div>'
+        '<label>Admin password<input type=password name=p id=rpw required autocomplete=off></label>'
+        '<div class=row><button type=button class=b2 onclick="this.closest(\'dialog\').close()">Cancel</button>'
+        '<button class=b1>Save</button></div></form></dialog>'
         # update from GitHub
         '<dialog id=udlg><form method=post action=/update '
         'onsubmit="var b=this.querySelector(\'.b1\');b.disabled=true;b.textContent=\'Checking…\'">'
@@ -990,10 +1140,13 @@ class H(common.Handler):
     def action(self, path, v):
         """Run a button; return (message, kind) to show, or None."""
         name, who = v("c"), self.client_address[0]
-        if path == "/scan":
-            start_scan(name)
+        if path == "/refresh":
+            refresh_all() if name == "*" else refresh(name)
         elif path == "/ping":
-            start_ping(name)
+            ping_component(name, v("ip"))
+        elif path == "/rename":
+            err = check_password(who, v("p"), admin_hash())
+            return (err, "err") if err else rename_component(name, v("h"), v("name"))
         elif path == "/toggle" and v("a") in ("enable", "disable"):
             err = check_password(who, v("p"), admin_hash())
             if err:

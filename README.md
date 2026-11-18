@@ -57,7 +57,7 @@ the update stops with a message and nothing is changed.
 
 Only PBKDF2-SHA256 hashes are stored.
 
-- **Admin password** (enable/disable a client, restart OpenVPN): hash in `/etc/openvpn/server/status-password`.
+- **Admin password** (enable/disable a client, restart OpenVPN, rename a component): hash in `/etc/openvpn/server/status-password`.
   An old plain-text password in that file is converted to its hash on start, so it keeps working.
   Change it with:
   `docker compose exec -it vpn-status python3 /app/vpn_status.py set-admin-password`
@@ -83,6 +83,10 @@ client-vehicle1 | .2 PLC, .10 HMI, .1 router | 192.168.1.0/24
 ```
 
 The optional last part is the real LAN inside the vehicle for 1:1 NAT sites.
+
+Components can also be renamed on the page with the ✏ button (admin password); the page edits this
+file and keeps all other lines. Name a component `router` to mark it as the router; an empty name
+removes it.
 
 ## License
 
