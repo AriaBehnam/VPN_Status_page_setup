@@ -3,6 +3,17 @@
 All notable changes to this project are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [2.2.1] – 2026-11-18
+
+### Fixed
+- Update button said "Could not find the docker compose project" and the installed version showed
+  "unknown": the compose labels were read with the wrong docker ps template (`.Labels` is a string,
+  `.Label "key"` reads one label).
+
+### Added
+- Fallback to find the project folder from where config.json is mounted, if Docker can't be asked.
+- The Update dialog shows why the version is unknown.
+
 ## [2.2.0] – 2026-11-18
 
 ### Added

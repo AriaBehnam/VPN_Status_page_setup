@@ -546,6 +546,7 @@ def schedule_restart(key):
 # ---------- update from GitHub ----------
 
 _project = {}
+_project_error = [""]
 _version = {"t": 0, "text": "", "last": ""}
 
 
@@ -565,16 +566,40 @@ def last_line(r):
 def project():
     """{dir, name, files} of this docker compose project, read from the container labels."""
     if not _project and HOST:
-        fmt = "|".join('{{index .Labels "com.docker.compose.%s"}}' % k
+        # in "docker ps --format", .Labels is one string; .Label "key" reads a single label
+        fmt = "|".join('{{.Label "com.docker.compose.%s"}}' % k
                        for k in ("project.working_dir", "project", "project.config_files"))
         r = host_run(["docker", "ps", "--filter", "label=com.docker.compose.service=" + COMPOSE_SERVICE,
                       "--format", fmt], 20)
         for line in r.stdout.splitlines():
-            p = line.split("|")
+            p = line.strip().split("|")
             if len(p) == 3 and p[0]:
                 _project.update(dir=p[0], name=p[1], files=[f for f in p[2].split(",") if f])
                 break
+        else:
+            _project_error[0] = last_line(r) if r.returncode else "no running container of service %s" % COMPOSE_SERVICE
+            d = mounted_project_dir()
+            if d:
+                _project.update(dir=d, name=re.sub(r"[^a-z0-9_-]", "", os.path.basename(d).lower()), files=[])
+    if _project:
+        _project_error[0] = ""
     return _project
+
+
+def mounted_project_dir():
+    """Fallback: the server folder config.json is mounted from (compose mounts ./config.json)."""
+    try:
+        lines = read_text("/proc/self/mountinfo").splitlines()
+    except OSError:
+        return ""
+    unescape = lambda s: re.sub(r"\\([0-7]{3})", lambda m: chr(int(m.group(1), 8)), s)
+    for line in lines:
+        f = line.split()
+        if len(f) > 4 and unescape(f[4]) == common.CONFIG_FILE:
+            d = os.path.dirname(unescape(f[3]))
+            if host_run(["test", "-f", os.path.join(d, "compose.yaml")], 10).returncode == 0:
+                return d
+    return ""
 
 
 def git(*args, timeout=30):
@@ -591,6 +616,8 @@ def version_info():
     if project():
         r = git("log", "-1", "--format=%h · %cs", timeout=10)
         _version["text"] = r.stdout.strip() if r.returncode == 0 else ""
+        if r.returncode:
+            _project_error[0] = "git: " + last_line(r)
         r = host_run(["tail", "-n", "1", os.path.join(project()["dir"], UPDATE_LOG)], 10)
         m = re.match(r"== (\S+ \S+) (start|done exit (\d+))", r.stdout.strip())
         _version["last"] = "" if not m else (
@@ -608,7 +635,7 @@ def update():
     try:
         p = project()
         if not p:
-            return "Could not find the docker compose project of this page on the server.", "err"
+            return "Could not find the docker compose project of this page on the server (%s)." % _project_error[0], "err"
         if git("rev-parse", "--git-dir").returncode:
             return "%s on the server is not a git clone, so it can't be updated from GitHub." % p["dir"], "err"
         r = git("fetch", "--quiet", GITHUB_REPO, GITHUB_BRANCH, timeout=90)
@@ -1095,7 +1122,8 @@ def render(msg="", kind=""):
         'on the PC. No OpenVPN restart is needed.</div>'
         '<div class=row><button type=button class=b2 onclick="this.closest(\'dialog\').close()">Cancel</button>'
         '<button class=b1>Create</button></div></form></dialog>') % (
-        esc(version or "unknown"), esc(last_update or "–"),
+        esc(version) if version else "unknown<div class=sub style='font-family:inherit'>%s</div>" % esc(_project_error[0]),
+        esc(last_update or "–"),
         esc(free_ip or "none free"), len(router_networks(ccd)))
 
     return common.page_shell("VPN clients", "vpn", body + dialogs, SCRIPT)
