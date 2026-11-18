@@ -1,0 +1,26 @@
+{
+  "title": "VPN status",
+  "server_ip": "10.8.0.1",
+  "vpn_network": "10.8.0.0/24",
+  "pc_host_range": [2, 255],
+  "pc_clients": [],
+  "server_dir": "/etc/openvpn/server",
+  "easyrsa_dir": "/etc/openvpn/easy-rsa",
+  "profiles_dir": "/root/router-bundles",
+  "client_template": "/root/router-bundles/tcrouter1/client.conf",
+  "nat": { "pool": "172.16.0.0/16", "real_lan": "192.168.1.0/24" },
+
+  "traffic_lights": {
+    "interface": "tun0",
+    "no_answer_seconds": 3,
+    "fleet_manager": { "ip": "192.168.12.127", "client": "client-fleetmanager-new" },
+    "main_plc":      { "ip": "192.168.0.3",    "client": "client-mainplc-new" },
+    "stations": [
+      { "name": "TL1", "ip": "192.168.13.2", "client": "client-trafficlight1-new", "register": 0 },
+      { "name": "TL2", "ip": "192.168.14.2", "client": "client-trafficlight2-new", "register": 1 },
+      { "name": "TL3", "ip": "192.168.15.2", "client": "client-trafficlight3-new", "register": 2 },
+      { "name": "TL4", "ip": "192.168.16.2", "client": "client-trafficlight4-new", "register": 3 },
+      { "name": "TL5", "ip": "192.168.17.2", "client": "client-trafficlight5-new", "register": 4 }
+    ]
+  }
+}

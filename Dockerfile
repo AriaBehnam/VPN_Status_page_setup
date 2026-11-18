@@ -3,5 +3,5 @@ RUN apt-get update \
  && apt-get install -y --no-install-recommends openssl iputils-ping iproute2 util-linux \
  && rm -rf /var/lib/apt/lists/*
 WORKDIR /app
-COPY vpn-status/vpn-status.py tl-status/tl-status.py ./
-ENV PYTHONUNBUFFERED=1
+COPY app/ ./
+ENV PYTHONUNBUFFERED=1 PYTHONDONTWRITEBYTECODE=1
