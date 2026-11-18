@@ -35,6 +35,24 @@ After a change: `docker compose restart`.
 docker compose up -d --build
 ```
 
+## Update button
+
+**Update** on the VPN page (same password as New PC) checks GitHub for a new version. If there is one it is
+downloaded (`git fetch` + fast-forward) and the containers are rebuilt with `docker compose up -d --build`;
+the pages are back after about a minute. The result of the last update is shown in the dialog and logged
+to `update.log` in the project folder.
+
+Needed once on the server:
+
+```sh
+apt install -y git                                     # if git is missing
+git clone https://github.com/AriaBehnam/VPN_Status_page_setup.git /opt/vpn-status
+cd /opt/vpn-status && docker compose up -d --build     # always start it from this clone
+```
+
+Local changes on the server (e.g. in `config.json`) are kept. If a new version changes the same file,
+the update stops with a message and nothing is changed.
+
 ## Passwords
 
 Only PBKDF2-SHA256 hashes are stored.
@@ -43,7 +61,7 @@ Only PBKDF2-SHA256 hashes are stored.
   An old plain-text password in that file is converted to its hash on start, so it keeps working.
   Change it with:
   `docker compose exec -it vpn-status python3 /app/vpn_status.py set-admin-password`
-- **New PC password**: hash in `CREATE_PASSWORD_HASH` in `app/vpn_status.py`.
+- **New PC and Update password**: hash in `CREATE_PASSWORD_HASH` in `app/vpn_status.py`.
   Make a new hash with `docker compose exec -it vpn-status python3 /app/vpn_status.py hash-password`.
 
 ## New PC

@@ -3,6 +3,15 @@
 All notable changes to this project are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [2.1.0] – 2026-11-18
+
+### Added
+- **Update** button (same password as New PC): checks the GitHub repo for a new version and, if there is one,
+  downloads it and rebuilds the containers automatically. The rebuild runs as a systemd job on the server,
+  so it finishes even while the page's own container is replaced. If the rebuild can't start, the server
+  goes back to the running version.
+- Installed version and last update result shown on the page; rebuild output logged to `update.log`.
+
 ## [2.0.0] – 2026-11-18
 
 ### Added

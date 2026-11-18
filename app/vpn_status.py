@@ -61,7 +61,7 @@ SCAN_MAX_HOSTS = 512
 # Admin password (enable/disable, OpenVPN restart): hash in ADMIN_PASSFILE. A plain-text
 # password found there (old setup) is replaced by its hash when the page starts.
 ADMIN_PASSFILE = SERVER_DIR + "/status-password"
-# "New PC" password. Change it with: python3 /app/vpn_status.py hash-password
+# "New PC" and "Update" password. Change it with: python3 /app/vpn_status.py hash-password
 CREATE_PASSWORD_HASH = os.environ.get("CREATE_PASSWORD_HASH") or (
     "pbkdf2_sha256$200000$5b2ed4c8a551971d298e57356ce9df1c$40fce35328e94cc2af47598c29517f23dc7d0782869dbe403fabee26f0b3c8a4")
 PBKDF2_ITERATIONS = 200_000
@@ -79,6 +79,13 @@ HOST = ["nsenter", "-t", "1", "-m", "-u", "-i", "-n", "-p", "--"] if os.environ.
 scan, lat, fails, flashes, downloads = {}, {}, {}, {}, {}
 lock = threading.Lock()
 create_lock = threading.Lock()
+update_lock = threading.Lock()
+
+# "Update" button: new versions come from this public GitHub repo
+GITHUB_REPO = "https://github.com/AriaBehnam/VPN_Status_page_setup.git"
+GITHUB_BRANCH = "main"
+COMPOSE_SERVICE = "vpn-status"          # used to find the project folder on the server
+UPDATE_LOG = "update.log"               # in the project folder, written by the rebuild
 
 
 # ---------- small helpers ----------
@@ -432,6 +439,104 @@ def schedule_restart(key):
                      stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
 
+# ---------- update from GitHub ----------
+
+_project = {}
+_version = {"t": 0, "text": "", "last": ""}
+
+
+def host_run(args, timeout=60):
+    """Run a command on the server itself (through nsenter when in Docker)."""
+    try:
+        return subprocess.run(HOST + args, capture_output=True, text=True, timeout=timeout)
+    except (OSError, subprocess.SubprocessError) as e:
+        return subprocess.CompletedProcess(args, 1, "", str(e))
+
+
+def last_line(r):
+    lines = (r.stderr or r.stdout or "").strip().splitlines()
+    return lines[-1] if lines else "exit code %d" % r.returncode
+
+
+def project():
+    """{dir, name, files} of this docker compose project, read from the container labels."""
+    if not _project and HOST:
+        fmt = "|".join('{{index .Labels "com.docker.compose.%s"}}' % k
+                       for k in ("project.working_dir", "project", "project.config_files"))
+        r = host_run(["docker", "ps", "--filter", "label=com.docker.compose.service=" + COMPOSE_SERVICE,
+                      "--format", fmt], 20)
+        for line in r.stdout.splitlines():
+            p = line.split("|")
+            if len(p) == 3 and p[0]:
+                _project.update(dir=p[0], name=p[1], files=[f for f in p[2].split(",") if f])
+                break
+    return _project
+
+
+def git(*args, timeout=30):
+    d = project().get("dir", "")
+    return host_run(["env", "GIT_TERMINAL_PROMPT=0", "GIT_SSH_COMMAND=ssh -o BatchMode=yes",
+                     "git", "-c", "safe.directory=" + d, "-C", d] + list(args), timeout)
+
+
+def version_info():
+    """(current version, last update result) for the page; cached for a minute."""
+    if time.time() - _version["t"] < 60:
+        return _version["text"], _version["last"]
+    _version["t"] = time.time()
+    if project():
+        r = git("log", "-1", "--format=%h · %cs", timeout=10)
+        _version["text"] = r.stdout.strip() if r.returncode == 0 else ""
+        r = host_run(["tail", "-n", "1", os.path.join(project()["dir"], UPDATE_LOG)], 10)
+        m = re.match(r"== (\S+ \S+) (start|done exit (\d+))", r.stdout.strip())
+        _version["last"] = "" if not m else (
+            "running since " + m.group(1) if m.group(2) == "start" else
+            "%s · %s" % (m.group(1)[:16], "ok" if m.group(3) == "0" else "failed, see %s" % UPDATE_LOG))
+    return _version["text"], _version["last"]
+
+
+def update():
+    """Fetch GitHub; if there is a new version, apply it and rebuild the containers. Returns (message, kind)."""
+    if not HOST:
+        return "The update button works only when the pages run in Docker.", "err"
+    if not update_lock.acquire(blocking=False):
+        return "An update check is already running.", "info"
+    try:
+        p = project()
+        if not p:
+            return "Could not find the docker compose project of this page on the server.", "err"
+        if git("rev-parse", "--git-dir").returncode:
+            return "%s on the server is not a git clone, so it can't be updated from GitHub." % p["dir"], "err"
+        r = git("fetch", "--quiet", GITHUB_REPO, GITHUB_BRANCH, timeout=90)
+        if r.returncode:
+            return "Could not read GitHub: %s" % last_line(r), "err"
+        head = git("rev-parse", "HEAD").stdout.strip()
+        new = git("rev-parse", "FETCH_HEAD").stdout.strip()
+        if head == new:
+            return "Already up to date (version %s)." % head[:7], "ok"
+        if git("merge-base", "--is-ancestor", "HEAD", "FETCH_HEAD").returncode:
+            return "The server has its own changes that are not on GitHub; update it by hand.", "err"
+        changes = git("log", "--format=%s", "HEAD..FETCH_HEAD").stdout.strip().splitlines()
+        r = git("merge", "--ff-only", "--quiet", "FETCH_HEAD")
+        if r.returncode:
+            return "Could not apply the new version: %s" % last_line(r), "err"
+        # rebuild in a separate systemd unit on the server, so it survives this container being replaced
+        compose = "docker compose -p '%s' %s" % (p["name"], " ".join("-f '%s'" % f for f in p["files"]))
+        script = ('cd "$0" || exit 1; { echo "== $(date \'+%%F %%T\') start"; %s up -d --build --remove-orphans; '
+                  'rc=$?; echo "== $(date \'+%%F %%T\') done exit $rc"; } >> %s 2>&1') % (compose, UPDATE_LOG)
+        r = host_run(["systemd-run", "--quiet", "--collect", "--unit", "vpn-status-update-%d" % time.time(),
+                      "sh", "-c", script, p["dir"]], 20)
+        if r.returncode:
+            git("reset", "--quiet", "--keep", head)    # back to the running version, so the next click retries
+            return "The rebuild could not start, nothing was changed: %s" % last_line(r), "err"
+        _version["t"] = 0
+        shown = "; ".join(changes[:5]) + (" …" if len(changes) > 5 else "")
+        return ("Updating %s → %s (%d change%s: %s). The pages restart in about a minute and this page "
+                "reloads by itself." % (head[:7], new[:7], len(changes), "" if len(changes) == 1 else "s", shown)), "info"
+    finally:
+        update_lock.release()
+
+
 # ---------- new PC client ----------
 
 def clean_name(raw):
@@ -749,6 +854,7 @@ SCRIPT = """
 var $=function(i){return document.getElementById(i)};
 function ask(b){$("dc").value=b.dataset.c;$("da").value=b.dataset.a;$("dt").textContent=b.dataset.t;$("dp").value="";$("dlg").showModal();$("dp").focus()}
 function restart(){$("rp").value="";$("rdlg").showModal();$("rp").focus()}
+function upd(){$("up").value="";$("udlg").showModal();$("up").focus()}
 function newc(){$("cf").reset();$("cdlg").showModal()}
 if(location.search)history.replaceState(null,"","/");
 setInterval(function(){if(document.querySelector("dialog[open]"))return;
@@ -780,7 +886,10 @@ def render(msg="", kind=""):
         '<button type=button class=tbtn onclick="restart()">%sRestart OpenVPN</button>' % ic("restart") +
         "<form method=post action=/restart onsubmit=\"return confirm('Restart the status page?')\">"
         "<input type=hidden name=c value=status><button class=tbtn title='Restart this page'>%sPage</button></form>"
-        % ic("restart"))
+        % ic("restart") +
+        '<button type=button class=tbtn onclick="upd()" title="Get the newest version from GitHub">%sUpdate</button>'
+        % ic("download"))
+    version, last_update = version_info()
     body = (
         '<div class=head><h1>VPN clients</h1>'
         '<span class=stat><b>%d</b> online · <b>%d</b> disabled · %d total</span>'
@@ -791,11 +900,12 @@ def render(msg="", kind=""):
         '<div class=foot>Scan and latency run only when pressed. Latency is the round trip from the server to each '
         'component behind the router. NAT sites show the address you use over the VPN and the real address inside '
         'the vehicle. Disabling blocks new connections; a connected client stays up until it drops or OpenVPN '
-        'restarts. Component names come from %s.</div>') % (
+        'restarts. Component names come from %s.%s</div>') % (
         len(live), ndis, len(names), tools,
         '<div class="msg %s">%s</div>' % (kind, esc(msg)) if msg else "", downloads_html(),
         ic("router"), len(sites), "".join(sites) or '<div class="card dls muted">No routers.</div>',
-        ic("monitor"), len(pcs), "".join(pcs) or '<tr><td colspan=4 class=muted>No PCs.</td></tr>', esc(DEVICES))
+        ic("monitor"), len(pcs), "".join(pcs) or '<tr><td colspan=4 class=muted>No PCs.</td></tr>', esc(DEVICES),
+        "<br>Version %s" % esc(version) if version else "")
 
     dialogs = (
         # enable / disable
@@ -811,6 +921,17 @@ def render(msg="", kind=""):
         '<label>Admin password<input type=password name=p id=rp required autocomplete=off></label>'
         '<div class=row><button type=button class=b2 onclick="this.closest(\'dialog\').close()">Cancel</button>'
         '<button class=b1>Restart</button></div></form></dialog>'
+        # update from GitHub
+        '<dialog id=udlg><form method=post action=/update '
+        'onsubmit="var b=this.querySelector(\'.b1\');b.disabled=true;b.textContent=\'Checking…\'">'
+        '<div class=dh>Update from GitHub</div>'
+        '<div class=facts><div><span>Installed version</span><b class=mono>%s</b></div>'
+        '<div><span>Last update</span><b>%s</b></div></div>'
+        '<div class=sub style="margin-bottom:12px">Checks GitHub for a new version. If there is one, it is '
+        'downloaded and installed, and the pages restart (about a minute).</div>'
+        '<label>Password<input type=password name=p id=up required autocomplete=off></label>'
+        '<div class=row><button type=button class=b2 onclick="this.closest(\'dialog\').close()">Cancel</button>'
+        '<button class=b1>Check and update</button></div></form></dialog>'
         # new PC
         '<dialog id=cdlg><form method=post action=/create id=cf '
         'onsubmit="var b=this.querySelector(\'.b1\');b.disabled=true;b.textContent=\'Creating…\'">'
@@ -824,6 +945,7 @@ def render(msg="", kind=""):
         'on the PC. No OpenVPN restart is needed.</div>'
         '<div class=row><button type=button class=b2 onclick="this.closest(\'dialog\').close()">Cancel</button>'
         '<button class=b1>Create</button></div></form></dialog>') % (
+        esc(version or "unknown"), esc(last_update or "–"),
         esc(free_ip or "none free"), len(router_networks(ccd)))
 
     return common.page_shell("VPN clients", "vpn", body + dialogs, SCRIPT)
@@ -893,6 +1015,9 @@ class H(common.Handler):
                 return err, "err"
             ok, text = create_pc(v("name"))
             return text, "ok" if ok else "err"
+        elif path == "/update":
+            err = check_password(who, v("p"), CREATE_PASSWORD_HASH)
+            return (err, "err") if err else update()
         return None
 
 
