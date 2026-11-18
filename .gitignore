@@ -1,0 +1,8 @@
+*.key
+*.crt
+*.pem
+*.ovpn
+*.zip
+status-password
+devices.txt
+__pycache__/

@@ -1,0 +1,27 @@
+services:
+  vpn-status:
+    build: .
+    command: ["python3", "/app/vpn-status.py"]
+    restart: unless-stopped
+    network_mode: host
+    pid: host
+    privileged: true
+    environment:
+      IN_CONTAINER: "1"
+      STATUS_FILE: /host/run/openvpn-server/status-server.log
+    volumes:
+      - /run:/host/run:ro
+      - /etc/openvpn:/etc/openvpn
+      - /usr/share/easy-rsa:/usr/share/easy-rsa:ro
+      - /root/router-bundles:/root/router-bundles
+
+  tl-status:
+    build: .
+    command: ["python3", "/app/tl-status.py"]
+    restart: unless-stopped
+    network_mode: host
+    cap_add: [NET_RAW, NET_ADMIN]
+    environment:
+      STATUS_FILE: /host/run/openvpn-server/status-server.log
+    volumes:
+      - /run:/host/run:ro
