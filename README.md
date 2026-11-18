@@ -61,17 +61,6 @@ manager register. Stations can be added and removed. The list is kept in
 `/etc/openvpn/server/traffic-lights.json` by the VPN page service; until the first save, the stations from
 `config.json` are used. `http://10.8.0.1:8082/#settings` opens the dialog directly.
 
-## Passwords
-
-Only PBKDF2-SHA256 hashes are stored.
-
-- **Admin password** (enable/disable a client, restart OpenVPN, rename a component, traffic light settings): hash in `/etc/openvpn/server/status-password`.
-  An old plain-text password in that file is converted to its hash on start, so it keeps working.
-  Change it with:
-  `docker compose exec -it vpn-status python3 /app/vpn_status.py set-admin-password`
-- **New PC and Update password**: hash in `CREATE_PASSWORD_HASH` in `app/vpn_status.py`.
-  Make a new hash with `docker compose exec -it vpn-status python3 /app/vpn_status.py hash-password`.
-
 ## New PC
 
 Only a name and the password are asked. The page then:
