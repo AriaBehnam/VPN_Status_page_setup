@@ -16,6 +16,7 @@ import glob
 import hashlib
 import hmac
 import ipaddress
+import json
 import os
 import re
 import secrets
@@ -1129,6 +1130,77 @@ def render(msg="", kind=""):
     return common.page_shell("VPN clients", "vpn", body + dialogs, SCRIPT)
 
 
+# ---------- traffic light stations (edited on the traffic light page) ----------
+# The traffic light page reads and saves its stations through /api/tl-settings, so the admin
+# password and devices.txt stay in this container.
+
+TL_FILE = SERVER_DIR + "/traffic-lights.json"
+STATION_NAME_RE = re.compile(r"^[A-Za-z0-9 _.-]{1,20}$")
+MAX_STATIONS = 50
+
+
+def tl_stations():
+    """Saved stations, or the ones in config.json until the page saves for the first time."""
+    try:
+        with open(TL_FILE) as f:
+            return json.load(f)["stations"]
+    except (OSError, ValueError, KeyError):
+        return CFG.get("traffic_lights", {}).get("stations", [])
+
+
+def tl_settings():
+    """Stations + every router with the components named in devices.txt (PLC candidates)."""
+    ccd, devcfg = read_ccd(), read_devices()
+    routers = []
+    for n in sorted(ccd):
+        if is_pc(n, ccd) or not ccd[n]["iroutes"]:
+            continue
+        labels = devcfg.get(n, {}).get("labels", {})
+        comps = [{"ip": ip, "label": label} for ip, label in labelled(ccd[n]["iroutes"], labels)
+                 if not is_router(label)]
+        routers.append({"client": n, "name": short(n), "disabled": ccd[n]["disabled"], "components": comps})
+    return {"stations": tl_stations(), "routers": routers}
+
+
+def save_tl_stations(raw):
+    """Check and save the station list sent by the traffic light page. Returns (ok, message)."""
+    try:
+        items = json.loads(raw)
+    except ValueError:
+        items = None
+    if not isinstance(items, list) or len(items) > MAX_STATIONS:
+        return False, "Invalid station list."
+    ccd = read_ccd()
+    out, names, ips = [], set(), set()
+    for i, st in enumerate(items, 1):
+        try:
+            name = " ".join(str(st["name"]).split())
+            client = str(st["client"])
+            ip = str(ipaddress.IPv4Address(str(st["ip"]).strip()))
+            reg = int(st["register"])
+        except (KeyError, TypeError, ValueError):
+            return False, "Station %d: fill in name, router, PLC and register." % i
+        if not STATION_NAME_RE.match(name):
+            return False, "Station %d: the name can have up to 20 letters, numbers, spaces, . _ or -." % i
+        if client not in ccd or not any(ipaddress.ip_address(ip) in ipaddress.ip_network(r)
+                                        for r in ccd[client]["iroutes"]):
+            return False, "%s: the PLC must be a component behind router %s." % (name, short(client))
+        if not 0 <= reg <= 255:
+            return False, "%s: the register must be between 0 and 255." % name
+        if name.lower() in names:
+            return False, "The name %s is used twice." % name
+        if ip in ips:
+            return False, "%s: this PLC is already used by another station." % name
+        names.add(name.lower())
+        ips.add(ip)
+        out.append({"name": name, "ip": ip, "client": client, "register": reg})
+    try:
+        write_file(TL_FILE, json.dumps({"stations": out}, indent=2) + "\n")
+    except OSError as e:
+        return False, "Could not save %s: %s" % (TL_FILE, e.strerror)
+    return True, "Saved %d station%s." % (len(out), "" if len(out) == 1 else "s")
+
+
 # ---------- HTTP ----------
 
 class H(common.Handler):
@@ -1144,6 +1216,8 @@ class H(common.Handler):
                 data = f.read()
             fn = os.path.basename(d["path"])
             self.send_body(data, "application/octet-stream", [("Content-Disposition", 'attachment; filename="%s"' % fn)])
+        elif u.path == "/api/tl-settings":
+            self.send_body(json.dumps(tl_settings()), "application/json")
         elif u.path in ("/", "/index.html"):
             with lock:
                 f = flashes.get((parse_qs(u.query).get("m") or [""])[0])
@@ -1157,13 +1231,25 @@ class H(common.Handler):
 
     def do_POST(self):
         n = int(self.headers.get("Content-Length") or 0)
-        data = parse_qs(self.rfile.read(min(n, 4096)).decode(errors="replace"))
+        data = parse_qs(self.rfile.read(min(n, 16384)).decode(errors="replace"))
         v = lambda k: (data.get(k) or [""])[0]
+        if urlparse(self.path).path == "/api/tl-settings":
+            self.tl_save(v)
+            return
         res = self.action(urlparse(self.path).path, v) if self.same_origin() else None
         self.send_response(303)
         self.send_header("Location", "/?m=" + flash(*res) if res else "/")
         self.send_header("Content-Length", "0")
         self.end_headers()
+
+    def tl_save(self, v):
+        """Called by the traffic light page server (same machine), which passes on the viewer's address."""
+        who = self.client_address[0]
+        if who == common.SERVER_IP and v("who"):
+            who = "tl:" + v("who")
+        err = "Not allowed." if not self.same_origin() else check_password(who, v("p"), admin_hash())
+        ok, msg = (False, err) if err else save_tl_stations(v("data"))
+        self.send_body(json.dumps({"ok": ok, "msg": msg}), "application/json")
 
     def action(self, path, v):
         """Run a button; return (message, kind) to show, or None."""

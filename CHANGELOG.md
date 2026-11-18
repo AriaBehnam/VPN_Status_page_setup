@@ -3,6 +3,18 @@
 All notable changes to this project are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [2.3.0] – 2026-11-18
+
+### Added
+- **Settings** on the traffic light page (admin password): choose for each station the router and which
+  of its components is the traffic light PLC, set the fleet manager register, add or remove stations.
+  Changes apply at once, without a restart.
+- The PLC list comes from the component names given on the VPN clients page (devices.txt).
+- Stations are kept by the VPN page service in `/etc/openvpn/server/traffic-lights.json`; the traffic light
+  page reads and saves them through a local API, so the password and devices.txt stay in one container.
+  The stations in config.json are the starting list until the first save.
+- `#settings` in the traffic light page address opens the Settings dialog.
+
 ## [2.2.1] – 2026-11-18
 
 ### Fixed

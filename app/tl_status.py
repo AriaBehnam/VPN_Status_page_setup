@@ -10,13 +10,17 @@ import socket
 import struct
 import threading
 import time
-from urllib.parse import urlparse
+import urllib.request
+from urllib.error import URLError
+from urllib.parse import parse_qs, urlencode, urlparse
 
 import common
 from common import ic, read_status
 
-# addresses and stations come from the "traffic_lights" part of config.json
+# addresses come from the "traffic_lights" part of config.json; the stations are chosen in the
+# Settings dialog and kept by the VPN page service (config.json stations are the starting list)
 CFG = common.CONFIG.get("traffic_lights", {})
+SETTINGS_URL = common.VPN_PAGE + "api/tl-settings"
 IFACE = CFG.get("interface", "tun0")
 FM, FM_ROUTER = CFG.get("fleet_manager", {}).get("ip"), CFG.get("fleet_manager", {}).get("client")
 PLC, PLC_ROUTER = CFG.get("main_plc", {}).get("ip"), CFG.get("main_plc", {}).get("client")
@@ -26,9 +30,63 @@ NO_ANSWER = float(CFG.get("no_answer_seconds", 3.0))   # no reply this long = st
 LOG_LINES = 20
 
 lock = threading.Lock()
-BY_IP = {s[1]: s[0] for s in STATIONS}
-tl = {s[0]: {"cmd": None, "status": None, "ok": None, "delay": None, "delays": [], "tw": None,
-             "seen": None, "changed": None, "writes": 0, "errors": 0} for s in STATIONS}
+BY_IP = {}
+tl = {}
+settings = {"routers": [], "stations": [], "error": ""}
+
+
+def new_state(ip):
+    return {"ip": ip, "cmd": None, "status": None, "ok": None, "delay": None, "delays": [], "tw": None,
+            "seen": None, "changed": None, "writes": 0, "errors": 0}
+
+
+def apply_stations(stations):
+    """Use a new station list; a station keeps its live data while its name and PLC stay the same."""
+    global STATIONS, BY_IP
+    with lock:
+        STATIONS = stations
+        BY_IP = {s[1]: s[0] for s in stations}
+        for name in [k for k in tl if k not in {s[0] for s in stations}]:
+            del tl[name]
+        for name, ip, _, _ in stations:
+            if name not in tl or tl[name]["ip"] != ip:
+                tl[name] = new_state(ip)
+
+
+def load_settings():
+    """Read the stations and the PLC candidates from the VPN page service."""
+    try:
+        with urllib.request.urlopen(SETTINGS_URL, timeout=5) as r:
+            data = json.load(r)
+        stations = [(s["name"], s["ip"], s["client"], int(s["register"])) for s in data["stations"]]
+    except (URLError, OSError, ValueError, KeyError, TypeError) as e:
+        settings["error"] = "VPN page not reachable (%s)" % getattr(e, "reason", e)
+        return False
+    settings.update(routers=data.get("routers", []), stations=data["stations"], error="")
+    apply_stations(stations)
+    return True
+
+
+def settings_loop():
+    while True:
+        load_settings()
+        time.sleep(30)
+
+
+def save_settings(form, who):
+    """Pass the new station list and the password on to the VPN page service."""
+    body = urlencode({"p": form.get("p", ""), "data": form.get("data", ""), "who": who}).encode()
+    try:
+        with urllib.request.urlopen(urllib.request.Request(SETTINGS_URL, data=body), timeout=10) as r:
+            res = json.load(r)
+    except (URLError, OSError, ValueError) as e:
+        return {"ok": False, "msg": "VPN page not reachable (%s)." % getattr(e, "reason", e)}
+    if res.get("ok"):
+        load_settings()
+    return res
+
+
+apply_stations(STATIONS)
 fm = {"regs": None, "seen": None, "changed": None}
 plc = {"sent": None}
 log = []
@@ -152,7 +210,8 @@ def snapshot():
 
 
 BODY = """
-<div class=head><h1>Traffic lights</h1><span class=stat id=sum>loading…</span></div>
+<div class=head><h1>Traffic lights</h1><span class=stat id=sum>loading…</span>
+<span class=tools><button type=button class=tbtn onclick="openSettings()">@@GEAR@@Settings</button></span></div>
 <div class=tiles>
  <div class="card tile"><div class=t>@@MONITOR@@Fleet manager → main PLC <span class=muted>(Modbus)</span></div><div class=v id=fm>–</div></div>
  <div class="card tile"><div class=t>@@CPU@@Main PLC → traffic lights <span class=muted>(S7)</span></div><div class=v id=plc>–</div></div>
@@ -166,6 +225,16 @@ BODY = """
 <div class=foot>Read passively from the VPN server's tunnel, so it adds no traffic on the 4G links.
 Requested = fleet manager register, Command = byte the main PLC writes (DB1.DBB0), Status = byte it reads back
 (DB2.DBB0). Link = server ↔ station round trip over 4G. Updates every second.</div>
+<dialog id=sdlg class=wide><form id=sf onsubmit="return saveSettings()">
+<div class=dh>Traffic light stations</div>
+<div class=sub style="margin-bottom:10px">For each station choose the router and which of its components is the
+traffic light PLC. The list of components comes from the names given on the VPN clients page.</div>
+<div class=card><table class=st><tr><th>Name<th>Router<th>PLC<th>Register<th></tr><tbody id=srows></tbody></table></div>
+<div class=row style="justify-content:flex-start;margin:10px 0 14px"><button type=button class=b2 onclick="addRow()">+ Add station</button></div>
+<div id=smsg></div>
+<label>Admin password<input type=password id=spw required autocomplete=off></label>
+<div class=row><button type=button class=b2 onclick="$('sdlg').close()">Cancel</button><button class=b1 id=ssave>Save</button></div>
+</form></dialog>
 """
 
 SCRIPT = """
@@ -209,17 +278,61 @@ function render(d){
   $('log').innerHTML=d.log.length?d.log.map(l=>'<div><span class=tm>'+esc(l.t)+'</span><span class='+l.k+'>'+esc(l.x)+'</span></div>').join(''):
     '<span class=muted>No changes yet. Change a traffic light in the fleet manager.</span>';
 }
+let ROUTERS=[];
+async function openSettings(){
+  $('smsg').innerHTML='';$('spw').value='';$('srows').innerHTML='<tr><td colspan=5 class=muted>loading…</td></tr>';
+  $('sdlg').showModal();
+  try{const d=await (await fetch('/api/settings',{cache:'no-store'})).json();
+    if(d.error){$('smsg').innerHTML='<div class=msg>'+esc(d.error)+'</div>'}
+    ROUTERS=d.routers;$('srows').innerHTML='';d.stations.forEach(addRow);if(!d.stations.length)addRow();}
+  catch(e){$('srows').innerHTML='<tr><td colspan=5 class=muted>could not load the settings</td></tr>'}
+}
+function plcOptions(sel,client,ip){
+  const r=ROUTERS.find(x=>x.client==client),c=r?r.components:[];
+  let o=c.map(x=>'<option value="'+esc(x.ip)+'"'+(x.ip==ip?' selected':'')+'>'+esc(x.label)+' – '+esc(x.ip)+'</option>');
+  if(ip&&!c.some(x=>x.ip==ip))o.unshift('<option value="'+esc(ip)+'" selected>'+esc(ip)+' (not named)</option>');
+  if(!o.length)o=['<option value="">no components named on the VPN page</option>'];
+  sel.innerHTML=o.join('');
+}
+function addRow(s){
+  s=s&&s.name!==undefined?s:{name:'',client:'',ip:'',register:$('srows').rows.length};
+  const tr=document.createElement('tr');
+  tr.innerHTML='<td><input class=sn maxlength=20 required placeholder="TL1"><td><select class=sr></select>'+
+    '<td><select class=sp></select><td><input class=sg type=number min=0 max=255 required style="width:70px">'+
+    '<td><button type=button class="btn sm" title="Remove" onclick="this.parentNode.parentNode.remove()">×</button>';
+  const sr=tr.querySelector('.sr'),sp=tr.querySelector('.sp');
+  let ro=ROUTERS.map(r=>'<option value="'+esc(r.client)+'"'+(r.client==s.client?' selected':'')+'>'+esc(r.name)+(r.disabled?' (disabled)':'')+'</option>');
+  if(s.client&&!ROUTERS.some(r=>r.client==s.client))ro.unshift('<option value="'+esc(s.client)+'" selected>'+esc(s.client)+' (unknown)</option>');
+  sr.innerHTML=ro.join('');
+  sr.onchange=()=>plcOptions(sp,sr.value,'');
+  plcOptions(sp,sr.value,s.ip);
+  tr.querySelector('.sn').value=s.name;tr.querySelector('.sg').value=s.register;
+  $('srows').appendChild(tr);
+}
+async function saveSettings(){
+  const st=[...$('srows').rows].map(r=>({name:r.querySelector('.sn').value,client:r.querySelector('.sr').value,
+    ip:r.querySelector('.sp').value,register:r.querySelector('.sg').value}));
+  const b=$('ssave');b.disabled=true;b.textContent='Saving…';
+  try{const r=await fetch('/settings',{method:'POST',body:new URLSearchParams({p:$('spw').value,data:JSON.stringify(st)})});
+    const d=await r.json();
+    $('smsg').innerHTML='<div class="msg '+(d.ok?'ok':'')+'">'+esc(d.msg)+'</div>';
+    if(d.ok)setTimeout(()=>$('sdlg').close(),1200);}
+  catch(e){$('smsg').innerHTML='<div class=msg>Could not save.</div>'}
+  b.disabled=false;b.textContent='Save';return false;
+}
 async function tick(){
   try{const r=await fetch('/api/status',{cache:'no-store'});render(await r.json());}
   catch(e){$('sum').textContent='connection lost – retrying…';}
   setTimeout(tick,1000);
 }
 tick();
+if(location.hash=='#settings')openSettings();
 """
 
 PAGE = common.page_shell(
     "Traffic lights", "tl",
-    BODY.replace("@@MONITOR@@", ic("monitor")).replace("@@CPU@@", ic("cpu")).replace("@@LIGHT@@", ic("light")),
+    BODY.replace("@@MONITOR@@", ic("monitor")).replace("@@CPU@@", ic("cpu")).replace("@@LIGHT@@", ic("light"))
+    .replace("@@GEAR@@", ic("gear")),
     SCRIPT.replace("@@NO@@", str(NO_ANSWER)).replace("@@CPU@@", ic("cpu")))
 
 
@@ -228,12 +341,28 @@ class H(common.Handler):
         path = urlparse(self.path).path
         if path == "/api/status":
             self.send_body(json.dumps(snapshot()), "application/json")
+        elif path == "/api/settings":
+            load_settings()
+            self.send_body(json.dumps({k: settings[k] for k in ("routers", "stations", "error")}), "application/json")
         elif path in ("/", "/index.html"):
             self.send_body(PAGE)
         else:
             self.send_error(404)
 
 
+    def do_POST(self):
+        n = int(self.headers.get("Content-Length") or 0)
+        form = {k: v[0] for k, v in parse_qs(self.rfile.read(min(n, 16384)).decode(errors="replace")).items()}
+        origin = self.headers.get("Origin")
+        if urlparse(self.path).path != "/settings":
+            self.send_error(404)
+        elif origin not in (None, common.TL_PAGE.rstrip("/"), "http://" + (self.headers.get("Host") or "")):
+            self.send_error(403)
+        else:
+            self.send_body(json.dumps(save_settings(form, self.client_address[0])), "application/json")
+
+
 if __name__ == "__main__":
     threading.Thread(target=sniff, daemon=True).start()
+    threading.Thread(target=settings_loop, daemon=True).start()
     common.serve(common.TL_PORT, H)

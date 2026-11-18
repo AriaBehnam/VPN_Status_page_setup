@@ -25,7 +25,7 @@ app/tl_status.py   traffic light page
 | `client_template` | `client.conf` whose server settings are copied into new PC profiles |
 | `profiles_dir` | where new `.ovpn` files are kept |
 | `nat` | 1:1 NAT pool and the real LAN behind it |
-| `traffic_lights` | fleet manager, main PLC and stations for the traffic light page; remove it to hide that page |
+| `traffic_lights` | fleet manager, main PLC and the starting station list for the traffic light page; remove it to hide that page |
 
 After a change: `docker compose restart`.
 
@@ -53,11 +53,19 @@ cd /opt/vpn-status && docker compose up -d --build     # always start it from th
 Local changes on the server (e.g. in `config.json`) are kept. If a new version changes the same file,
 the update stops with a message and nothing is changed.
 
+## Traffic light stations
+
+**Settings** on the traffic light page (admin password): for each station choose the router and which of
+its components is the traffic light PLC (the components named on the VPN clients page), plus the fleet
+manager register. Stations can be added and removed. The list is kept in
+`/etc/openvpn/server/traffic-lights.json` by the VPN page service; until the first save, the stations from
+`config.json` are used. `http://10.8.0.1:8082/#settings` opens the dialog directly.
+
 ## Passwords
 
 Only PBKDF2-SHA256 hashes are stored.
 
-- **Admin password** (enable/disable a client, restart OpenVPN, rename a component): hash in `/etc/openvpn/server/status-password`.
+- **Admin password** (enable/disable a client, restart OpenVPN, rename a component, traffic light settings): hash in `/etc/openvpn/server/status-password`.
   An old plain-text password in that file is converted to its hash on start, so it keeps working.
   Change it with:
   `docker compose exec -it vpn-status python3 /app/vpn_status.py set-admin-password`
